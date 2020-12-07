@@ -389,6 +389,14 @@ class Exercise(Directive):
     stub the `numfig_format.exercise` Sphinx setting variable can be set to the
     desired string formatter.
 
+    This directive maintains content of each exercise in a Sphinx environmental
+    variable `sl_exercise_dict`, which is of the form::
+        {'links': {docname: set(exercise_names),
+                   ...},
+         'exercises': {exercise_name: exercise_content,
+                       ...}
+        }
+
     Notes:
         `env.domaindata['std']` and `env.domains['std']` hold the reference
         catalogue.
@@ -463,6 +471,20 @@ class Exercise(Directive):
         self.state.nested_parse(
             self.content, self.content_offset, exercise_content_node)
 
+        # memorise the content of each exercise for a later use in solutions
+        # (the content of an exercise is automatically copied to the solution)
+        names_ = exercise_content_node['names']
+        assert len(names_) == 1
+        name_ = names_[0]
+        if not hasattr(env, 'sl_exercise_dict'):
+            env.sl_exercise_dict = {'links': {}, 'exercises': {}}
+        assert name_ not in env.sl_exercise_dict['exercises']
+        if env.docname in env.sl_exercise_dict['links']:
+            env.sl_exercise_dict['links'][env.docname].add(name_)
+        else:
+            env.sl_exercise_dict['links'][env.docname] = {name_}
+        env.sl_exercise_dict['exercises'][name_] = exercise_content_node
+
         return [exercise_content_node]
 
 
@@ -492,6 +514,43 @@ def set_exercise_numfig_format(app, config):
     # override the default numfig format with values in the config file
     numfig_format.update(config.numfig_format)
     config.numfig_format = numfig_format
+
+
+def purge_exercise_dict(app, env, docname):
+    """
+    Cleans the information stored in the Sphinx environment about exercises
+    (`sl_exercise_dict`). If a document gets regenerated, the information
+    whether this document has any exercises and their content is removed before
+    the document is processed again.
+
+    This function is hooked up to the `env-purge-doc` Sphinx event.
+    """
+    if hasattr(env, 'sl_exercise_dict'):
+        # if the document had an exercise and is now being rebuilt, remove it
+        # from the store
+        if docname in env.sl_exercise_dict['links']:
+            for exercise in env.sl_exercise_dict['links'][docname]:
+                del env.sl_exercise_dict['exercises'][exercise]
+            del env.sl_exercise_dict['links'][docname]
+
+
+def merge_exercise_dict(app, env, docnames, other):
+    """
+    In case documents are processed in parallel, the data stored in
+    `sl_exercise_dict` Sphinx environment variable from different threads need
+    to merged.
+
+    This function is hooked up to the `env-merge-info` Sphinx event.
+    """
+    if not hasattr(env, 'sl_exercise_dict'):
+        env.sl_exercise_dict = dict()
+    if hasattr(other, 'sl_exercise_dict'):
+        for key, val in other.sl_exercise_dict['links'].items():
+            assert key not in env.sl_exercise_dict['links']
+            env.sl_exercise_dict['links'][key] = val
+        for key, val in other.sl_exercise_dict['exercises'].items():
+            assert key not in env.sl_exercise_dict['exercises']
+            env.sl_exercise_dict['exercises'][key] = val
 
 
 #### Solution directive #######################################################
@@ -578,23 +637,42 @@ def depart_solution_title_node_(self, node):
 
 
 class Solution(Directive):
-    """See the coresponding exercise function."""
+    """
+    See the coresponding exercise function.
+
+    TODO: an optional override parameter to copy the content of an exercise to
+    a solution::
+        ---
+        override: false
+        ---
+
+    The problem is that if it's to be done in the `doctree-resolved` stage of
+    the build, unresolved doctree references are transferred.
+    """
     required_arguments = 1
     optional_arguments = 0
     final_argument_whitespace = False
     has_content = True
-    option_spec = {}
+    option_spec = {'override': directives.unchanged}
 
     def run(self):
         """See the coresponding exercise function."""
         env = self.state.document.settings.env
+
+        # TODO: so no repeat; add override parameter optional to solution directive
+        if 'override' in self.options:
+            override = self.options['override']
+            assert isinstance(override, bool)
+        else:
+            override = True
 
         label = self.arguments[0]
         assert label.startswith('ex:')
         sol_label = 'sol:{}'.format(label[3:])
 
         solution_content_node = solution('\n'.join(self.content),
-                                         exercise=label)
+                                         exercise=label,
+                                         override=override)
 
         self.options['name'] = sol_label
         self.add_name(solution_content_node)
@@ -621,6 +699,31 @@ def set_solution_numfig_format(app, config):
     # override the default numfig format with values in the config file
     numfig_format.update(config.numfig_format)
     config.numfig_format = numfig_format
+
+
+def process_solutions(app, env):
+    """TODO"""
+    from pprint import pprint
+    pprint(app.builder.__dict__)
+    env = app.builder.env
+    assert hasattr(env, 'sl_exercise_dict')
+
+    exercise_list = test
+
+    for node in doctree.traverse(solution):
+        override = node.attributes['override']
+        if not override:
+            continue
+
+        exercise_label = node.attributes['exercise']
+
+        new_node = node.deepcopy()
+        del new_node.children[1:]
+        print('\n\n*****************\n')
+        for i in env.sl_exercise_dict['exercises'][exercise_label].children[1:]:
+            print(i)
+            new_node += i
+        node.replace_self(new_node)
 
 
 #### SWISH directive ##########################################################
@@ -1351,7 +1454,10 @@ def setup(app):
     # connect custom hooks to the Sphinx build process
     app.connect('env-purge-doc', purge_swish_detect)
     app.connect('env-merge-info', merge_swish_detect)
+    app.connect('env-purge-doc', purge_exercise_dict)
+    app.connect('env-merge-info', merge_exercise_dict)
     app.connect('doctree-resolved', inject_swish_detect)
+    app.connect('env-check-consistency', process_solutions)
     app.connect('env-get-outdated', analyse_swish_code)
     app.connect('config-inited', set_exercise_numfig_format)
     app.connect('config-inited', set_solution_numfig_format)
